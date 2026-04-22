@@ -1,12 +1,15 @@
 package com.gasagency.dsc.service;
 
 import com.gasagency.dsc.dto.AgencySetupRequest;
+import com.gasagency.dsc.dto.CallResult;
 import com.gasagency.dsc.entity.Agency;
 import com.gasagency.dsc.entity.Call;
 import com.gasagency.dsc.entity.Campaign;
 import com.gasagency.dsc.enums.CallStatus;
 import com.gasagency.dsc.repository.CallRepository;
 import com.gasagency.dsc.repository.CampaignRepository;
+import com.gasagency.dsc.service.telephony.TelephonyProviderFactory;
+import com.gasagency.dsc.service.telephony.TelephonyService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -14,9 +17,6 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
-
-import com.twilio.Twilio;
-import jakarta.annotation.PostConstruct;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -30,28 +30,19 @@ public class ElevenLabsService {
     private final CallRepository callRepository;
     private final CampaignRepository campaignRepository;
     private final ObjectMapper objectMapper;
-    private final String twilioAccountSid;
-    private final String twilioAuthToken;
-    private final String twilioPhoneNumber;
+    private final TelephonyProviderFactory telephonyFactory;
     private final String publicUrl;
-    private final String elevenlabsAgentPhoneNumberId;
 
     public ElevenLabsService(
             @Value("${elevenlabs.api.key:}") String apiKey,
             @Value("${elevenlabs.api.base-url:https://api.elevenlabs.io/v1}") String baseUrl,
-            @Value("${twilio.account.sid:}") String twilioAccountSid,
-            @Value("${twilio.auth.token:}") String twilioAuthToken,
-            @Value("${twilio.phone.number:}") String twilioPhoneNumber,
             @Value("${app.public.url:}") String publicUrl,
-            @Value("${elevenlabs.agent.phone.number.id:}") String elevenlabsAgentPhoneNumberId,
+            TelephonyProviderFactory telephonyFactory,
             CallRepository callRepository,
             CampaignRepository campaignRepository,
             ObjectMapper objectMapper) {
-        this.twilioAccountSid = twilioAccountSid;
-        this.twilioAuthToken = twilioAuthToken;
-        this.twilioPhoneNumber = twilioPhoneNumber;
         this.publicUrl = publicUrl;
-        this.elevenlabsAgentPhoneNumberId = elevenlabsAgentPhoneNumberId;
+        this.telephonyFactory = telephonyFactory;
         this.webClient = WebClient.builder()
                 .baseUrl(baseUrl)
                 .defaultHeader("xi-api-key", apiKey)
@@ -60,14 +51,6 @@ public class ElevenLabsService {
         this.callRepository = callRepository;
         this.campaignRepository = campaignRepository;
         this.objectMapper = objectMapper;
-    }
-
-    @PostConstruct
-    public void init() {
-        if (twilioAccountSid != null && !twilioAccountSid.isBlank()) {
-            Twilio.init(twilioAccountSid, twilioAuthToken);
-            log.info("Twilio SDK initialized natively");
-        }
     }
 
     /**
@@ -177,51 +160,37 @@ public class ElevenLabsService {
     }
 
     /**
-     * Trigger batch calls for a campaign.
+     * Trigger batch calls for a campaign using the agency's configured telephony provider.
      */
     public void startBatchCalls(Agency agency, Campaign campaign, List<Call> calls) {
         if (agency.getElevenLabsAgentId() == null) {
             log.error("No ElevenLabs agent configured for agency {}", agency.getId());
             throw new IllegalStateException("ElevenLabs agent not configured. Complete setup first.");
         }
-        if (elevenlabsAgentPhoneNumberId == null || elevenlabsAgentPhoneNumberId.isBlank()) {
-             log.error("No ElevenLabs agent phone number ID configured (elevenlabs.agent.phone.number.id). Native calls blocked.");
-             throw new IllegalStateException("Missing native phone routing integration");
-        }
 
-        log.info("Batch calls executing natively via ElevenLabs for campaign {}: {} calls", campaign.getId(), calls.size());
-        
+        TelephonyService telephony = telephonyFactory.getProvider(agency);
+        log.info("Batch calls via {} for campaign {}: {} calls",
+                telephony.getProviderName(), campaign.getId(), calls.size());
+
+        // TODO: Add TRAI compliance check before production (DND scrubbing, calling hours)
+
         calls.forEach(call -> {
             try {
                 String toPhone = call.getCustomer().getPhone();
-                Map<String, Object> reqBody = Map.of(
-                        "agent_id", agency.getElevenLabsAgentId(),
-                        "agent_phone_number_id", elevenlabsAgentPhoneNumberId,
-                        "to_number", toPhone
-                );
+                CallResult result = telephony.makeCall(toPhone, agency.getElevenLabsAgentId());
 
-                String response = webClient.post()
-                        .uri("/convai/twilio/outbound-call")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .bodyValue(reqBody)
-                        .retrieve()
-                        .bodyToMono(String.class)
-                        .block();
-                
-                log.info("Native Twilio Outbound Dispatch Success: {}", response);
-                call.setTwilioCallSid("elevenlabs_native_" + System.currentTimeMillis() + "_" + call.getId());
+                call.setTwilioCallSid(result.callId());
                 call.setStatus(CallStatus.QUEUED);
-                call.setCalledAt(LocalDateTime.now());
+                call.setCalledAt(result.initiatedAt());
                 callRepository.save(call);
-            } catch (org.springframework.web.reactive.function.client.WebClientResponseException e) {
-                log.error("Native ElevenLabs out call failed for {}: Body: {}", call.getCustomer().getPhone(), e.getResponseBodyAsString());
-                call.setStatus(CallStatus.FAILED);
-                call.setNotes("ElevenLabs API failed: " + e.getResponseBodyAsString());
-                callRepository.save(call);
+
+                log.info("{} call dispatched to {}: {}",
+                        result.providerName(), toPhone, result.callId());
             } catch (Exception e) {
-                log.error("Native ElevenLabs out call failed for {}: {}", call.getCustomer().getPhone(), e.getMessage());
+                log.error("Call failed for {} via {}: {}",
+                        call.getCustomer().getPhone(), telephony.getProviderName(), e.getMessage());
                 call.setStatus(CallStatus.FAILED);
-                call.setNotes("Dispatch failed: " + e.getMessage());
+                call.setNotes("Dispatch failed (" + telephony.getProviderName() + "): " + e.getMessage());
                 callRepository.save(call);
             }
         });
@@ -318,37 +287,27 @@ public class ElevenLabsService {
 
     /**
      * Trigger a single test call to the agency's transfer number so the owner can hear the agent.
+     * Uses the agency's configured telephony provider.
      */
     public void triggerTestCall(Agency agency) {
         if (agency.getElevenLabsAgentId() == null) {
             throw new IllegalStateException("No ElevenLabs agent configured for agency " + agency.getId());
         }
-        if (elevenlabsAgentPhoneNumberId == null || elevenlabsAgentPhoneNumberId.isBlank()) {
-            throw new IllegalStateException("ElevenLabs phone number not configured");
-        }
+
+        TelephonyService telephony = telephonyFactory.getProvider(agency);
+        log.info("Triggering test call for agency {} via {}", agency.getId(), telephony.getProviderName());
 
         try {
-            Map<String, Object> reqBody = Map.of(
-                    "agent_id", agency.getElevenLabsAgentId(),
-                    "agent_phone_number_id", elevenlabsAgentPhoneNumberId,
-                    "to_number", agency.getTransferNumber()
+            CallResult result = telephony.makeCall(
+                    agency.getTransferNumber(),
+                    agency.getElevenLabsAgentId()
             );
-
-            String response = webClient.post()
-                    .uri("/convai/twilio/outbound-call")
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .bodyValue(reqBody)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
-
-            log.info("Test call initiated for agency {} via native ElevenLabs: {}", agency.getId(), response);
-        } catch (org.springframework.web.reactive.function.client.WebClientResponseException e) {
-            log.error("Test call failed for agency {}: {}", agency.getId(), e.getResponseBodyAsString());
-            throw new RuntimeException("Test call failed: " + e.getResponseBodyAsString(), e);
+            log.info("Test call initiated for agency {} via {}: {}",
+                    agency.getId(), result.providerName(), result.callId());
         } catch (Exception e) {
-            log.error("Test call failed for agency {}: {}", agency.getId(), e.getMessage());
-            throw new RuntimeException("Failed to trigger test call", e);
+            log.error("Test call failed for agency {} via {}: {}",
+                    agency.getId(), telephony.getProviderName(), e.getMessage());
+            throw new RuntimeException("Failed to trigger test call via " + telephony.getProviderName(), e);
         }
     }
 

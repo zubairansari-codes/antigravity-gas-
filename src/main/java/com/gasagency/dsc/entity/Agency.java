@@ -1,6 +1,7 @@
 package com.gasagency.dsc.entity;
 
 import com.gasagency.dsc.enums.PlanType;
+import com.gasagency.dsc.enums.TelephonyProvider;
 import jakarta.persistence.*;
 import lombok.*;
 import org.hibernate.annotations.CreationTimestamp;
@@ -50,6 +51,11 @@ public class Agency {
 
     @Column(name = "elevenlabs_agent_id")
     private String elevenLabsAgentId;
+
+    @Builder.Default
+    @Enumerated(EnumType.STRING)
+    @Column(name = "telephony_provider")
+    private TelephonyProvider telephonyProvider = TelephonyProvider.TWILIO;
 
     @Column(name = "twilio_phone_number")
     private String twilioPhoneNumber;
