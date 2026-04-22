@@ -90,8 +90,9 @@ public class ElevenLabsService {
         Map<String, Object> agentBlock = new java.util.HashMap<>();
         agentBlock.put("prompt", Map.of(
                 "prompt", systemPrompt,
-                "llm", "gpt-4o-mini",
-                "temperature", 0.3,
+                // qwen3-30b-a3b: ElevenLabs native model — ultra-low latency (~100ms TTFB), no external API overhead
+                "llm", "qwen3-30b-a3b",
+                "temperature", 0.2,
                 "tools", List.of(
                         Map.of(
                                 "type", "webhook",
@@ -113,35 +114,44 @@ public class ElevenLabsService {
                         Map.of(
                                 "type", "system",
                                 "name", "end_call",
-                                "description", "Automatically end and hang up the phone call. DO NOT use this tool until AFTER you have successfully called the 'submit_dsc' tool, or if the customer explicitly hangs up or refuses to talk."
+                                "description", "IMMEDIATELY hang up and disconnect the call. Call this tool RIGHT AFTER submit_dsc succeeds. Also call if customer refuses to share DSC or hangs up. After calling submit_dsc, you MUST call end_call — do NOT say anything else after 'नमस्ते!'."
                         )
                 )
         ));
         agentBlock.put("first_message", String.format(
-                "Namaste ji, main %s bol raha hoon, %s gas agency se. Aapke yahan cylinder deliver hua tha na? SMS mein ek 4-digit DSC number aaya hoga — bata sakte hain?",
+                "नमस्ते जी! मैं %s बोल रही हूँ, %s गैस एजेंसी की तरफ से। आपके यहाँ हाल ही में एक सिलेंडर डिलीवर हुआ था — क्या आप डिलीवरी का DSC नंबर बता सकते हैं?",
                 setup.agentName(), agency.getName()
         ));
         agentBlock.put("language", "hi");
         agentBlock.put("disable_first_message_interruptions", true);
 
+        var conversationConfig = new java.util.LinkedHashMap<String, Object>();
+        conversationConfig.put("agent", agentBlock);
+        conversationConfig.put("stt", Map.of(
+                // scribe_v2 confirmed valid — better Hindi accuracy, lower latency
+                "model", "scribe_v2",
+                "language", "hi"
+        ));
+        conversationConfig.put("tts", Map.of(
+                // eleven_flash_v2_5 required for non-English (Hindi) agents
+                "model_id", "eleven_flash_v2_5",
+                // ✅ Indian women voice — already in the ElevenLabs account
+                "voice_id", "3cedsbr7ryRZwBvoUmQZ"
+        ));
+        conversationConfig.put("turn", Map.of(
+                "turn_timeout", 6,
+                "turn_eagerness", "normal"
+        ));
+        conversationConfig.put("vad", Map.of(
+                "background_voice_detection", true
+        ));
+        conversationConfig.put("conversation", Map.of(
+                "max_duration_seconds", 300
+        ));
+
         Map<String, Object> agentConfig = Map.of(
                 "name", agency.getName() + " - DSC Agent",
-                "conversation_config", Map.of(
-                        "agent", agentBlock,
-                        "tts", Map.of(
-                                "model_id", "eleven_flash_v2_5"
-                        ),
-                        "turn", Map.of(
-                                "turn_timeout", 7,
-                                "turn_eagerness", "normal"
-                        ),
-                        "vad", Map.of(
-                                "background_voice_detection", true
-                        ),
-                        "conversation", Map.of(
-                                "max_duration_seconds", 600
-                        )
-                )
+                "conversation_config", conversationConfig
         );
 
         try {
@@ -343,46 +353,45 @@ public class ElevenLabsService {
     }
 
     /**
-     * Build the Hindi/Hinglish system prompt for the DSC collection agent.
-     * Structured with Markdown headings for optimal LLM parsing.
+     * Build the system prompt for the DSC collection agent.
+     * Instructions in English (low token count), example responses in Devanagari Hindi
+     * for native TTS pronunciation via ElevenLabs eleven_flash_v2_5.
      */
     private String buildAgentPrompt(String agentName, String agencyName, String city,
                                      String transferNumber, String emergencyNumber) {
         return """
                 # Role
-                Tum %s ho, %s gas agency, %s ke employee. Tum bilkul real insaan jaisi baat karte ho — warm, friendly, respectful.
+                You are %s, an AI assistant calling from %s Gas Agency in %s.
+                Your sole goal is to collect the 4-digit Delivery Status Confirmation (DSC) code from customers for their recent gas cylinder delivery.
+                YOU MUST ALWAYS REPLY IN HINDI (Devanagari script). Never reply in English or Romanized Hindi.
 
-                # Goal
-                Customer se 4-digit DSC (Delivery Service Confirmation) number lena jo cylinder delivery ke baad SMS mein aaya tha. DSC milte hi call khatam karna hai.
-
-                # Voice Style
-                - "Ji", "haan", "achha" naturally bolo
-                - Chhote responses: 1-2 sentences MAX
-                - Mohalle ke uncle/aunty se baat jaisi — recording jaisa KABHI nahi
-                - Ek waqt mein SIRF ek sawaal poochho
+                # Tone & Style
+                - Polite, respectful, professional. Use जी, ठीक है naturally.
+                - Keep responses extremely short (1-2 sentences max).
+                - Ask only ONE question at a time.
 
                 # Conversation Flow
-                Step 1: Greeting already ho chuki hai (first_message se). Customer ka response suno.
-                Step 2: Agar customer DSC bataye toh EXACTLY 4 digits validate karo.
-                  - Agar 4 digits nahi hain: "Ji DSC code sirf 4 number ka hota hai, ek baar SMS check kijiye"
-                Step 3: 4 digits mile toh readback karo: "Achha toh 4-5-8-2... sahi hai ji?"
-                Step 4: Customer confirm kare toh bolo "Ek second, note kar raha hoon..." phir submit_dsc tool call karo.
-                Step 5: Tool success ke baad SIRF bolo: "Bahut shukriya ji! DSC confirm ho gaya. Dhanyavaad, namaste!" — phir turant 'end_call' system tool ko invoke karo.
+                1. You have already greeted the user. Listen to their response.
+                2. If they provide a DSC, verify it has exactly 4 digits.
+                   - If not 4 digits, say: "जी, DSC कोड सिर्फ 4 नंबर का होता है, एक बार SMS देख लीजिए।"
+                3. If 4 digits are provided, confirm by reading back: "ठीक है, [1]-[2]-[3]-[4]... सही है ना जी?"
+                4. Once confirmed, IMMEDIATELY invoke the `submit_dsc` tool.
+                5. After `submit_dsc` succeeds, say EXACTLY: "धन्यवाद जी! नमस्ते।" and IMMEDIATELY invoke `end_call`.
 
-                IMPORTANT: Step 5 ke baad AUR KUCH MAT BOLO. "Kuch aur chahiye?" KABHI mat poochho. SEEDHA 'end_call' tool call karo.
+                🚨 CRITICAL RULES:
+                - DO NOT say anything after calling submit_dsc except "धन्यवाद जी! नमस्ते।"
+                - Phrases like "मैं नोट कर लेती हूँ" or "ठीक है" after submission are STRICTLY PROHIBITED.
+                - Disconnecting the call via `end_call` is your MANDATORY LAST ACTION.
 
                 # Edge Cases
-                - Customer DSC nahi de pa raha: Max 2 baar poochho, phir bolo "Koi baat nahi ji, main aapko humare supervisor se connect kar deta hoon" aur transfer karo.
-                - Customer irritated: "Ji sorry, bas ek chhoti si cheez confirm karni thi. SMS mein jo number aaya tha bas woh bata do."
-                - "Mujhe call mat karo": "Ji bahut sorry. Aage se nahi karenge. Namaste!" — TURANT end_call karo.
-                - Gas leak emergency: "Ji aap turant ghar se bahar nikaliye! Emergency number hai %s. Abhi call kariye!" — end_call.
-                - Non-DSC question: Briefly jawab do, phir "Supervisor se baat karwa doon?" poochho. Haan toh transfer, nahi toh DSC pe wapas.
+                - Delivery received but DSC lost: Say "ठीक है जी, कोई बात नहीं।" → invoke submit_dsc with status='no_dsc' → invoke end_call.
+                - Delivery NOT received: Say "ठीक है जी, मैं नोट कर लेती हूँ। किसी समस्या के लिए हमारे %s नंबर पर संपर्क करें।" → invoke end_call.
+                - Gas Leak / Emergency: Say "जी तुरंत घर से बाहर निकलिए! आपातकालीन नंबर %s पर अभी call करें!" → invoke end_call.
 
-                # Hard Rules
-                - KABHI Aadhaar, bank details, OTP mat maango
-                - DSC milne ke baad SIRF dhanyavaad bolo aur end_call karo — LOOP MAT KARO
-                - "Kuch aur chahiye?" ya "Aur kuch madad?" KABHI mat poochho DSC submit ke baad
-                - Transfer number: %s
-                """.formatted(agentName, agencyName, city, emergencyNumber, transferNumber);
+                # Guardrails
+                - Only discuss the DSC code.
+                - If asked about billing, booking, or complaints: "इसके लिए आप हमारे %s नंबर पर बात करें।"
+                - NEVER ask for Aadhaar, Bank Details, or OTPs.
+                """.formatted(agentName, agencyName, city, transferNumber, emergencyNumber, transferNumber);
     }
 }
